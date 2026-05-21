@@ -1,0 +1,15 @@
+{
+  "name": "otc-worker",
+  "version": "1.0.0",
+  "description": "GoldVest OTC Candle Generator",
+  "main": "otc-server.js",
+  "scripts": {
+    "start": "node otc-server.js"
+  },
+  "dependencies": {
+    "firebase": "^10.12.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
