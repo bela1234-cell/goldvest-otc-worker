@@ -5,7 +5,7 @@
 // ============================================================
 
 const { initializeApp } = require('firebase/app');
-const { getDatabase, ref, push, query, orderByKey, limitToLast, get } = require('firebase/database');
+const { getDatabase, ref, push, set, query, orderByKey, limitToLast, get } = require('firebase/database');
 
 // ── Firebase config ──────────────────────────────────────
 const firebaseConfig = {
@@ -201,6 +201,16 @@ async function tick(id) {
 
   if (state.price > state.candleHigh) state.candleHigh = state.price;
   if (state.price < state.candleLow)  state.candleLow  = state.price;
+
+  // Live candle Firebase এ লেখো — সব client এটা পড়বে
+  const liveCandle = {
+    time:  state.candleTime,
+    open:  state.candleOpen,
+    high:  state.candleHigh,
+    low:   state.candleLow,
+    close: state.price
+  };
+  set(ref(db, `otc_candles/${id}/live`), liveCandle).catch(() => {});
 
   // Candle close
   if (now >= state.nextCandle) {
