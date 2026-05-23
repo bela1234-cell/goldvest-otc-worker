@@ -76,7 +76,17 @@ async function saveCandle(id, candle) {
   }
 }
 
-// ── Random trend ─────────────────────────────────────────
+// ── Save live (running) candle to Firebase ───────────────
+// Client এই data পড়ে running candle real-time দেখতে পায়
+// set() ব্যবহার করা হয় — push() না, কারণ একটাই live candle থাকবে
+function saveLiveCandle(id, candle) {
+  try {
+    const r = ref(db, `otc_candles/${id}/live`);
+    set(r, candle).catch(() => {});
+  } catch (e) {}
+}
+
+
 function randomTrend() {
   const r = Math.random();
   if (r < 0.38) return 1;
@@ -202,16 +212,6 @@ async function tick(id) {
   if (state.price > state.candleHigh) state.candleHigh = state.price;
   if (state.price < state.candleLow)  state.candleLow  = state.price;
 
-  // Live candle Firebase এ লেখো — সব client এটা পড়বে
-  const liveCandle = {
-    time:  state.candleTime,
-    open:  state.candleOpen,
-    high:  state.candleHigh,
-    low:   state.candleLow,
-    close: state.price
-  };
-  set(ref(db, `otc_candles/${id}/live`), liveCandle).catch(() => {});
-
   // Candle close
   if (now >= state.nextCandle) {
     const closed = {
@@ -223,11 +223,34 @@ async function tick(id) {
     };
     await saveCandle(id, closed);
 
+    // Live candle clear করো — নতুন candle শুরু হচ্ছে
+    try {
+      set(ref(db, `otc_candles/${id}/live`), null).catch(() => {});
+    } catch (e) {}
+
     state.candleTime  = state.nextCandle / 1000;
     state.candleOpen  = state.price;
     state.candleHigh  = state.price;
     state.candleLow   = state.price;
     state.nextCandle += CANDLE_MS;
+
+    // Chain close বন্ধ
+    while (state.nextCandle <= now) {
+      state.candleTime  = state.nextCandle / 1000;
+      state.nextCandle += CANDLE_MS;
+    }
+
+  } else {
+    // Running candle Firebase এ write করো
+    // Client এই data real-time দেখে — reload করলেও same candle পাবে
+    saveLiveCandle(id, {
+      time:       state.candleTime,
+      open:       state.candleOpen,
+      high:       state.candleHigh,
+      low:        state.candleLow,
+      close:      state.price,
+      nextCandle: state.nextCandle  // client জানবে candle কখন শেষ হবে
+    });
   }
 }
 
