@@ -5,7 +5,7 @@
 // ============================================================
 
 const { initializeApp } = require('firebase/app');
-const { getDatabase, ref, push, set, get, onValue, query, orderByKey, limitToLast } = require('firebase/database');
+const { getDatabase, ref, push, query, orderByKey, limitToLast, get } = require('firebase/database');
 
 // ── Firebase config ──────────────────────────────────────
 const firebaseConfig = {
@@ -23,16 +23,25 @@ const db  = getDatabase(app);
 
 // ── OTC Markets ──────────────────────────────────────────
 const OTC_MARKETS = [
-  { id: 'BTCOTC', baseSymbol: 'BTCUSDT' },
-  { id: 'ETHOTC', baseSymbol: 'ETHUSDT' },
-  { id: 'BNBOTC', baseSymbol: 'BNBUSDT' },
-  { id: 'SOLOTC',  baseSymbol: 'SOLUSDT' },
-  { id: 'USDTBDT', baseSymbol: null, startPrice: 110.50 },
-];
+  // Crypto OTC
+  { id: 'BTCOTC',     baseSymbol: 'BTCUSDT',  startPrice: 0      },
+  { id: 'ETHOTC',     baseSymbol: 'ETHUSDT',  startPrice: 0      },
+  { id: 'BNBOTC',     baseSymbol: 'BNBUSDT',  startPrice: 0      },
+  { id: 'SOLOTC',     baseSymbol: 'SOLUSDT',  startPrice: 0      },
 
-// ── OTC Admin Controls cache (per symbol) ────────────────
-// Server প্রতি tick এ Firebase থেকে control পড়ে apply করে
-const _controls = {};
+  // Currencies OTC — Binance এ নেই, fixed startPrice দাও
+  { id: 'EURUSDOTC',  baseSymbol: null,        startPrice: 1.085  },
+  { id: 'GBPUSDOTC',  baseSymbol: null,        startPrice: 1.265  },
+  { id: 'USDJPYOTC',  baseSymbol: null,        startPrice: 157.50 },
+  { id: 'AUDUSDOTC',  baseSymbol: null,        startPrice: 0.645  },
+  { id: 'USDCADOTC',  baseSymbol: null,        startPrice: 1.365  },
+  { id: 'EURGBPOTC',  baseSymbol: null,        startPrice: 0.858  },
+
+  // Commodities OTC
+  { id: 'XAUUSDOTC',  baseSymbol: null,        startPrice: 2320.0 },
+  { id: 'XAGUSDOTC',  baseSymbol: null,        startPrice: 27.50  },
+  { id: 'WTICRUDOTC', baseSymbol: null,        startPrice: 78.50  },
+];
 
 const TICK_MS   = 500;
 const CANDLE_MS = 60 * 1000;
@@ -63,10 +72,7 @@ async function loadLastCandle(id, baseSymbol) {
       return vals[0]; // { time, open, high, low, close }
     }
   } catch (e) {}
-  // Firebase এ কিছু নেই → Binance থেকে price নাও
-  const p = await fetchRealPrice(baseSymbol);
-  const price = p > 0 ? p : 100;
-  console.log(`[${id}] Starting fresh from Binance @ $${price}`);
+  // Firebase এ কিছু নেই → fresh start
   return null; // null মানে fresh start
 }
 
@@ -81,17 +87,7 @@ async function saveCandle(id, candle) {
   }
 }
 
-// ── Save live (running) candle to Firebase ───────────────
-// Client এই data পড়ে running candle real-time দেখতে পায়
-// set() ব্যবহার করা হয় — push() না, কারণ একটাই live candle থাকবে
-function saveLiveCandle(id, candle) {
-  try {
-    const r = ref(db, `otc_candles/${id}/live`);
-    set(r, candle).catch(() => {});
-  } catch (e) {}
-}
-
-
+// ── Random trend ─────────────────────────────────────────
 function randomTrend() {
   const r = Math.random();
   if (r < 0.38) return 1;
@@ -151,7 +147,7 @@ async function backfillCandles(id, lastCandleTime, lastPrice) {
 
 // ── Initialize one symbol ────────────────────────────────
 async function initSymbol(market) {
-  const { id, baseSymbol, startPrice: fixedStart } = market;
+  const { id, baseSymbol } = market;
 
   // Last candle Firebase থেকে নাও
   const lastCandle = await loadLastCandle(id, baseSymbol);
@@ -176,23 +172,16 @@ async function initSymbol(market) {
   } else {
     // Firebase এ কিছু নেই
     if (baseSymbol) {
-      // Binance থেকে price নাও (BTCOTC, ETHOTC etc.)
+      // Binance থেকে নাও (Crypto)
       startPrice = await fetchRealPrice(baseSymbol);
-      if (!startPrice || startPrice <= 0) startPrice = fixedStart || 100;
+      if (!startPrice || startPrice <= 0) startPrice = market.startPrice || 100;
       console.log(`[${id}] Starting fresh from Binance @ $${startPrice}`);
     } else {
-      // Binance এ নেই (USDTBDT) — fixed price দিয়ে শুরু
-      startPrice = fixedStart || 110.50;
+      // Forex/Commodity — fixed startPrice ব্যবহার করো
+      startPrice = market.startPrice || 1.0;
       console.log(`[${id}] Starting fresh with fixed price @ $${startPrice}`);
     }
   }
-
-  // Admin control listener — Firebase থেকে realtime control পড়ো
-  _controls[id] = { mode: 'auto', nextDirection: 'auto', volatility: 'medium', trendStrength: 0.6, wickFactor: 0.4, speedMultiplier: 1.0 };
-  const ctrlRef = ref(db, `otc_controls/${id}`);
-  onValue(ctrlRef, (snap) => {
-    if (snap.exists()) _controls[id] = { ..._controls[id], ...snap.val() };
-  });
 
   const candleStart = Math.floor(now / CANDLE_MS) * CANDLE_MS;
 
@@ -213,45 +202,20 @@ async function tick(id) {
   const state = _states[id];
   if (!state) return;
 
-  const now  = Date.now();
-  const ctrl = _controls[id] || {};
+  const now = Date.now();
 
-  // ── Volatility multiplier ──
-  const volMap = { low: 0.4, medium: 1.0, high: 2.2 };
-  const volMul = volMap[ctrl.volatility] || 1.0;
-  const speed  = ctrl.speedMultiplier || 1.0;
-  const trendStr = ctrl.trendStrength || 0.6;
-
-  // ── Mode: AUTO (default) ──
-  if (!ctrl.mode || ctrl.mode === 'auto') {
-    if (state.trendSteps <= 0) {
-      state.trend      = randomTrend();
-      state.trendSteps = Math.round((8 + Math.floor(Math.random() * 12)) / speed);
-    }
-    state.trendSteps--;
+  // Trend update
+  if (state.trendSteps <= 0) {
+    state.trend      = randomTrend();
+    state.trendSteps = 8 + Math.floor(Math.random() * 12);
   }
-  // ── Mode: MANUAL — admin direction follow করো ──
-  else if (ctrl.mode === 'manual') {
-    const dir = ctrl.nextDirection;
-    if (dir === 'up')        state.trend = 1;
-    else if (dir === 'down') state.trend = -1;
-    else if (dir === 'doji') state.trend = 0;
-    else                     state.trend = 0;
-    state.trendSteps = 99;
-  }
-  // ── Mode: TRADE-BASED ──
-  else if (ctrl.mode === 'trade-based') {
-    if (state.trendSteps <= 0) {
-      state.trendSteps = 8 + Math.floor(Math.random() * 8);
-    }
-    state.trendSteps--;
-  }
+  state.trendSteps--;
 
   // Price movement
-  const volatility = state.price * 0.0008 * volMul;
-  const trendBias  = state.trend * volatility * trendStr;
+  const volatility = state.price * 0.0008;
+  const trendBias  = state.trend * volatility * 0.4;
   const noise      = (Math.random() - 0.5) * volatility * 2;
-  state.price      = Math.max(state.price + (trendBias + noise) * speed, 0.0001);
+  state.price      = Math.max(state.price + trendBias + noise, 0.0001);
 
   if (state.price > state.candleHigh) state.candleHigh = state.price;
   if (state.price < state.candleLow)  state.candleLow  = state.price;
@@ -267,34 +231,11 @@ async function tick(id) {
     };
     await saveCandle(id, closed);
 
-    // Live candle clear করো — নতুন candle শুরু হচ্ছে
-    try {
-      set(ref(db, `otc_candles/${id}/live`), null).catch(() => {});
-    } catch (e) {}
-
     state.candleTime  = state.nextCandle / 1000;
     state.candleOpen  = state.price;
     state.candleHigh  = state.price;
     state.candleLow   = state.price;
     state.nextCandle += CANDLE_MS;
-
-    // Chain close বন্ধ
-    while (state.nextCandle <= now) {
-      state.candleTime  = state.nextCandle / 1000;
-      state.nextCandle += CANDLE_MS;
-    }
-
-  } else {
-    // Running candle Firebase এ write করো
-    // Client এই data real-time দেখে — reload করলেও same candle পাবে
-    saveLiveCandle(id, {
-      time:       state.candleTime,
-      open:       state.candleOpen,
-      high:       state.candleHigh,
-      low:        state.candleLow,
-      close:      state.price,
-      nextCandle: state.nextCandle  // client জানবে candle কখন শেষ হবে
-    });
   }
 }
 
