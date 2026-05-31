@@ -1,11 +1,12 @@
 // ============================================================
 // otc-server.js — OTC Candle Generator Server
 // Render.com এ 24/7 চলবে।
-// প্রতি মিনিটে সব OTC symbol এর candle generate করে Firebase এ save করে।
+// Firestore onSnapshot — Admin থেকে market add করলেই auto start।
 // ============================================================
 
-const { initializeApp } = require('firebase/app');
+const { initializeApp }                                          = require('firebase/app');
 const { getDatabase, ref, push, set, get, onValue, query, orderByKey, limitToLast } = require('firebase/database');
+const { getFirestore, collection, onSnapshot }                   = require('firebase/firestore');
 
 // ── Firebase config ──────────────────────────────────────
 const firebaseConfig = {
@@ -18,33 +19,9 @@ const firebaseConfig = {
   databaseURL:       "https://deepseek-e2447-default-rtdb.firebaseio.com"
 };
 
-const app = initializeApp(firebaseConfig);
-const db  = getDatabase(app);
-
-// ── OTC Markets ──────────────────────────────────────────
-const OTC_MARKETS = [
-  // Crypto OTC
-  { id: 'BTCOTC',     baseSymbol: 'BTCUSDT', startPrice: 0      },
-  { id: 'ETHOTC',     baseSymbol: 'ETHUSDT', startPrice: 0      },
-  { id: 'BNBOTC',     baseSymbol: 'BNBUSDT', startPrice: 0      },
-  { id: 'SOLOTC',     baseSymbol: 'SOLUSDT', startPrice: 0      },
-
-  // USDT/BDT
-  { id: 'USDTBDT',    baseSymbol: null,       startPrice: 110.50 },
-
-  // Currencies OTC
-  { id: 'EURUSDOTC',  baseSymbol: null,       startPrice: 1.085  },
-  { id: 'GBPUSDOTC',  baseSymbol: null,       startPrice: 1.265  },
-  { id: 'USDJPYOTC',  baseSymbol: null,       startPrice: 157.50 },
-  { id: 'AUDUSDOTC',  baseSymbol: null,       startPrice: 0.645  },
-  { id: 'USDCADOTC',  baseSymbol: null,       startPrice: 1.365  },
-  { id: 'EURGBPOTC',  baseSymbol: null,       startPrice: 0.858  },
-
-  // Commodities OTC
-  { id: 'XAUUSDOTC',  baseSymbol: null,       startPrice: 2320.0 },
-  { id: 'XAGUSDOTC',  baseSymbol: null,       startPrice: 27.50  },
-  { id: 'WTICRUDOTC', baseSymbol: null,       startPrice: 78.50  },
-];
+const app      = initializeApp(firebaseConfig);
+const db       = getDatabase(app);
+const firestore = getFirestore(app);
 
 // ── OTC Admin Controls cache (per symbol) ────────────────
 const _controls = {};
@@ -54,6 +31,9 @@ const CANDLE_MS = 60 * 1000;
 
 // ── Per-symbol state ─────────────────────────────────────
 const _states = {};
+
+// ── Active tick symbols set ───────────────────────────────
+const _activeMarkets = new Set();
 
 // ── Fetch real price from Binance ────────────────────────
 async function fetchRealPrice(symbol) {
@@ -67,7 +47,7 @@ async function fetchRealPrice(symbol) {
 }
 
 // ── Load last saved candle from Firebase ─────────────────
-async function loadLastCandle(id) {
+async function loadLastCandle(id, baseSymbol) {
   try {
     const r    = ref(db, `otc_candles/${id}/candles`);
     const q    = query(r, orderByKey(), limitToLast(1));
@@ -78,6 +58,9 @@ async function loadLastCandle(id) {
       return vals[0];
     }
   } catch (e) {}
+  const p = await fetchRealPrice(baseSymbol);
+  const price = p > 0 ? p : 100;
+  console.log(`[${id}] Starting fresh from Binance @ $${price}`);
   return null;
 }
 
@@ -109,8 +92,8 @@ function randomTrend() {
 
 // ── Backfill missing candles ─────────────────────────────
 async function backfillCandles(id, lastCandleTime, lastPrice) {
-  const now         = Math.floor(Date.now() / 1000);
-  const candleSec   = CANDLE_MS / 1000;
+  const now          = Math.floor(Date.now() / 1000);
+  const candleSec    = CANDLE_MS / 1000;
   const firstMissing = lastCandleTime + candleSec;
   const lastMissing  = Math.floor(now / candleSec) * candleSec - candleSec;
   const missingCount = Math.floor((lastMissing - lastCandleTime) / candleSec);
@@ -120,9 +103,7 @@ async function backfillCandles(id, lastCandleTime, lastPrice) {
   const toFill = Math.min(missingCount, 480);
   console.log(`[${id}] Backfilling ${toFill} missing candles...`);
 
-  let price = lastPrice;
-  let trend = 0;
-  let trendSteps = 0;
+  let price = lastPrice, trend = 0, trendSteps = 0;
 
   for (let i = 0; i < toFill; i++) {
     const candleTime = firstMissing + (i * candleSec);
@@ -141,8 +122,7 @@ async function backfillCandles(id, lastCandleTime, lastPrice) {
       if (price > high) high = price;
       if (price < low)  low  = price;
     }
-    const candle = { time: candleTime, open, high, low, close: price };
-    await saveCandle(id, candle);
+    await saveCandle(id, { time: candleTime, open, high, low, close: price });
   }
 
   console.log(`[${id}] Backfill complete. Last price: $${price.toFixed(4)}`);
@@ -153,7 +133,13 @@ async function backfillCandles(id, lastCandleTime, lastPrice) {
 async function initSymbol(market) {
   const { id, baseSymbol, startPrice: fixedStart } = market;
 
-  const lastCandle = await loadLastCandle(id);
+  // Already running — skip
+  if (_activeMarkets.has(id)) {
+    console.log(`[${id}] Already running, skipping init.`);
+    return;
+  }
+
+  const lastCandle = await loadLastCandle(id, baseSymbol);
 
   let startPrice;
   const now       = Date.now();
@@ -189,17 +175,30 @@ async function initSymbol(market) {
   });
 
   const candleStart = Math.floor(now / CANDLE_MS) * CANDLE_MS;
-
   _states[id] = {
-    price:       startPrice,
-    candleOpen:  startPrice,
-    candleHigh:  startPrice,
-    candleLow:   startPrice,
-    candleTime:  candleStart / 1000,
-    nextCandle:  candleStart + CANDLE_MS,
-    trend:       0,
-    trendSteps:  0,
+    price:      startPrice,
+    candleOpen: startPrice,
+    candleHigh: startPrice,
+    candleLow:  startPrice,
+    candleTime: candleStart / 1000,
+    nextCandle: candleStart + CANDLE_MS,
+    trend:      0,
+    trendSteps: 0,
   };
+
+  _activeMarkets.add(id);
+  console.log(`[${id}] Engine started ✅`);
+}
+
+// ── Stop one symbol ──────────────────────────────────────
+function stopSymbol(id) {
+  if (!_activeMarkets.has(id)) return;
+  _activeMarkets.delete(id);
+  delete _states[id];
+  delete _controls[id];
+  // live candle clear
+  set(ref(db, `otc_candles/${id}/live`), null).catch(() => {});
+  console.log(`[${id}] Engine stopped ⛔`);
 }
 
 // ── Tick one symbol ──────────────────────────────────────
@@ -207,9 +206,8 @@ async function tick(id) {
   const state = _states[id];
   if (!state) return;
 
-  const now  = Date.now();
-  const ctrl = _controls[id] || {};
-
+  const now      = Date.now();
+  const ctrl     = _controls[id] || {};
   const volMap   = { low: 0.4, medium: 1.0, high: 2.2 };
   const volMul   = volMap[ctrl.volatility] || 1.0;
   const speed    = ctrl.speedMultiplier || 1.0;
@@ -223,14 +221,10 @@ async function tick(id) {
     state.trendSteps--;
   } else if (ctrl.mode === 'manual') {
     const dir = ctrl.nextDirection;
-    if (dir === 'up')        state.trend = 1;
-    else if (dir === 'down') state.trend = -1;
-    else                     state.trend = 0;
+    state.trend      = dir === 'up' ? 1 : dir === 'down' ? -1 : 0;
     state.trendSteps = 99;
   } else if (ctrl.mode === 'trade-based') {
-    if (state.trendSteps <= 0) {
-      state.trendSteps = 8 + Math.floor(Math.random() * 8);
-    }
+    if (state.trendSteps <= 0) state.trendSteps = 8 + Math.floor(Math.random() * 8);
     state.trendSteps--;
   }
 
@@ -243,18 +237,15 @@ async function tick(id) {
   if (state.price < state.candleLow)  state.candleLow  = state.price;
 
   if (now >= state.nextCandle) {
-    const closed = {
+    await saveCandle(id, {
       time:  state.candleTime,
       open:  state.candleOpen,
       high:  state.candleHigh,
       low:   state.candleLow,
       close: state.price
-    };
-    await saveCandle(id, closed);
+    });
 
-    try {
-      set(ref(db, `otc_candles/${id}/live`), null).catch(() => {});
-    } catch (e) {}
+    set(ref(db, `otc_candles/${id}/live`), null).catch(() => {});
 
     state.candleTime  = state.nextCandle / 1000;
     state.candleOpen  = state.price;
@@ -278,25 +269,66 @@ async function tick(id) {
   }
 }
 
+// ── Firestore onSnapshot — Admin market add/remove detect ─
+function watchFirestoreMarkets() {
+  const marketsCol = collection(firestore, 'markets');
+
+  onSnapshot(marketsCol, (snapshot) => {
+    snapshot.docChanges().forEach(async (change) => {
+      const data = change.doc.data();
+      const id   = change.doc.id;
+
+      // শুধু OTC market — binance real feed skip
+      const isOTC = data.otc === true || data.feed === 'otc-engine' || data.feed === 'usdtbdt-engine';
+      if (!isOTC) return;
+
+      if (change.type === 'added' || change.type === 'modified') {
+        // visible false হলে stop
+        if (data.visible === false) {
+          stopSymbol(id);
+          return;
+        }
+        // নতুন বা updated market — init করো
+        await initSymbol({
+          id,
+          baseSymbol:  data.baseSymbol || null,
+          startPrice:  data.startPrice || 1.0,
+        });
+      }
+
+      if (change.type === 'removed') {
+        stopSymbol(id);
+      }
+    });
+  }, (err) => {
+    console.error('[Firestore] onSnapshot error:', err.message);
+  });
+
+  console.log('[Firestore] Watching markets collection...');
+}
+
 // ── Main ─────────────────────────────────────────────────
 async function main() {
   console.log('OTC Server starting...');
-  for (const market of OTC_MARKETS) {
-    await initSymbol(market);
-  }
-  console.log('All OTC engines initialized. Ticking...');
+
+  // Firestore market watch শুরু করো
+  watchFirestoreMarkets();
+
+  // Tick loop — প্রতি 500ms active markets tick করো
   setInterval(() => {
-    OTC_MARKETS.forEach(m => tick(m.id));
+    _activeMarkets.forEach(id => tick(id));
   }, TICK_MS);
+
+  console.log('OTC Server running. Waiting for markets from Firestore...');
 }
 
 main().catch(console.error);
 
-// Render এ process alive রাখার জন্য HTTP server
+// ── HTTP server — Render alive রাখার জন্য ───────────────
 const http = require('http');
 http.createServer((req, res) => {
   res.writeHead(200);
-  res.end('OTC Worker Running');
+  res.end(`OTC Worker Running | Active: ${[..._activeMarkets].join(', ') || 'none'}`);
 }).listen(process.env.PORT || 3000, () => {
   console.log('HTTP server listening on port', process.env.PORT || 3000);
 });
